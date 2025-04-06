@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# gpg-forward.sh - A script to forward GPG agent socket from WSL to a remote host
+# Copyright (C) Dale Phurrough
+# Licensed under the Apache License, Version 2.0
+# http://www.apache.org/licenses/LICENSE-2.0
+# This script is provided "as-is" without any warranty of any kind.
+
 set -euo pipefail
 
 # Default to auto port selection
@@ -152,7 +158,7 @@ trap 'cleanup; exit 0' INT
 trap cleanup EXIT TERM
 
 # Kill any existing socat processes for the chosen port
-pkill -f "socat.*${GPG_PORT}.*gpg-agent" || true
+pkill -f "socat.*${GPG_PORT}.*npiperelay.*gpg-agent" || true
 
 # Start socat for main GPG agent socket - forward Windows socket to TCP port
 echo "Start npiperelay for local named pipe -> TCP socket"
@@ -186,7 +192,7 @@ remote_cleanup() {
   fi
 
   # Kill any other socat processes using a port-specific pattern
-  pkill -f "socat.*localhost:${GPG_PORT}" 2>/dev/null || true
+  pkill -f "socat.*gpg-agent.*localhost:${GPG_PORT}" 2>/dev/null || true
   echo "Remote GPG forwarding stopped"
 
   # Delete this script itself
@@ -205,7 +211,7 @@ mkdir -p ~/.gnupg /run/user/\$(id -u)/gnupg
 chmod 700 ~/.gnupg /run/user/\$(id -u)/gnupg
 
 # Kill any existing socat processes
-pkill -f "socat.*gnupg.*${GPG_PORT}" || true
+pkill -f "socat.*gpg-agent.*localhost:${GPG_PORT}" || true
 
 # Create a Unix socket that forwards to the TCP port
 socat -d0 UNIX-LISTEN:/run/user/\$(id -u)/gnupg/S.gpg-agent,fork,unlink-early,mode=600 \\
@@ -281,7 +287,7 @@ if [ "$FORK_MODE" = true ]; then
     ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "$REMOTE_SCRIPT" > "$LOG_FILE" 2>&1
 
     # kill remote socat with port-specific pattern even if remote script failed to do so
-    ssh "$REMOTE_HOST" "pkill -f 'socat.*localhost:${GPG_PORT}'" >> "$LOG_FILE" 2>&1 || true
+    ssh "$REMOTE_HOST" "pkill -f 'socat.*gpg-agent.*localhost:${GPG_PORT}'" >> "$LOG_FILE" 2>&1 || true
 
     echo "SSH connection closed" >> "$LOG_FILE"
 
@@ -331,7 +337,7 @@ else
 fi
 
 # kill remote socat with port-specific pattern even if remote script failed to do so
-ssh "$REMOTE_HOST" "pkill -f 'socat.*localhost:${GPG_PORT}'" || true
+ssh "$REMOTE_HOST" "pkill -f 'socat.*gpg-agent.*localhost:${GPG_PORT}'" || true
 
 # Exit with the appropriate code
 exit $FINAL_EXIT
