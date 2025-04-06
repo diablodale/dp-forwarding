@@ -3,6 +3,7 @@ set -euo pipefail
 
 GPG_PORT=16448
 EXPORT_EMAIL=""
+FORK_MODE=false
 
 # Check dependencies
 function app_version_lt_min() {
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       EXPORT_EMAIL="${1#*=}"
       shift
       ;;
+    --fork)
+      FORK_MODE=true
+      shift
+      ;;
     *)
       REMOTE_HOST="$1"
       shift
@@ -51,7 +56,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "${REMOTE_HOST:-}" ]; then
-  echo "Usage: $0 [--export=your@email.com] <remote-host>"
+  echo "Usage: $0 [--export=your@email.com] [--fork] <remote-host>"
   exit 1
 fi
 
@@ -222,10 +227,39 @@ fi
 # Use Remote forwarding with additional options:
 # -t: Force terminal allocation to ensure signals are properly forwarded
 # This pushes the local GPG port to the remote machine
-ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "/tmp/gpg-forward-remote.sh"
+if [ "$FORK_MODE" = true ]; then
+  # not yet ready
+  echo "❌ ERROR: Fork mode is not yet implemented"
+  exit 1
 
-# Try to kill remote socat even if the remote script failed to do so
-ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true"
+  # Create a log file for the forked process
+  LOG_FILE="/tmp/gpg-forward-${REMOTE_HOST}-$(date +%s).log"
 
-# No need for cleanup here as the trap will handle it
-echo "SSH connection closed"
+  # Launch SSH in background, redirecting output to log file
+  {
+    ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "/tmp/gpg-forward-remote.sh" > "$LOG_FILE" 2>&1
+
+    # Try to kill remote socat even if the remote script failed to do so
+    ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true" >> "$LOG_FILE" 2>&1
+
+    echo "SSH connection closed" >> "$LOG_FILE"
+  } &
+
+  # Store PID in a file for potential later management
+  PID_FILE="/tmp/gpg-forward-${REMOTE_HOST}.pid"
+  echo $! > "$PID_FILE"
+
+  echo "✅ GPG forwarding started in background (PID: $!)"
+  echo "Log file: $LOG_FILE"
+  echo "To terminate: kill $(cat "$PID_FILE")"
+  exit 0
+else
+  # Original non-forking behavior
+  ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "/tmp/gpg-forward-remote.sh"
+
+  # Try to kill remote socat even if the remote script failed to do so
+  ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true"
+
+  # No need for cleanup here as the trap will handle it
+  echo "SSH connection closed"
+fi
