@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPG_PORT=16448
+# Default to auto port selection
+GPG_PORT="auto"
 EXPORT_EMAIL=""
 FORK_MODE=false
 
@@ -48,6 +49,10 @@ while [[ $# -gt 0 ]]; do
       FORK_MODE=true
       shift
       ;;
+    --port=*)
+      GPG_PORT="${1#*=}"
+      shift
+      ;;
     *)
       REMOTE_HOST="$1"
       shift
@@ -56,7 +61,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "${REMOTE_HOST:-}" ]; then
-  echo "Usage: $0 [--export=your@email.com] [--fork] <remote-host>"
+  echo "Usage: $0 [--export=your@email.com] [--fork] [--port=NUMBER|auto] <remote-host>"
+  exit 1
+fi
+
+# Handle port selection
+if [[ "$GPG_PORT" == "auto" ]]; then
+  # Find a free port in the dynamic/private range (49152-65535)
+  while true; do
+    SELECTED_PORT=$(shuf -i 49152-65535 -n 1)
+    if ! ss -lnt | awk '{print $4}' | grep -q ":$SELECTED_PORT\$"; then
+      GPG_PORT=$SELECTED_PORT
+      echo "Selected TCP port: $GPG_PORT"
+      break
+    fi
+  done
+elif ! [[ "$GPG_PORT" =~ ^[0-9]+$ ]]; then
+  echo "❌ ERROR: Invalid port value. Use a number or 'auto'"
   exit 1
 fi
 
@@ -138,22 +159,35 @@ socat TCP4-LISTEN:${GPG_PORT},bind=localhost,fork,reuseaddr \
     EXEC:"npiperelay.exe -ei -ep -a \"${WIN_ASSUAN_FILE}\"" &
 SOCAT_PID=$!
 
-# Create remote setup script with added verification step
+# Create remote setup script with port-specific filename
 TMP_SCRIPT=$(mktemp)
-cat > "$TMP_SCRIPT" << 'EOF'
+REMOTE_SCRIPT="/tmp/gpg-forward-remote-${GPG_PORT}.sh"
+
+cat > "$TMP_SCRIPT" << EOF
 #!/bin/bash
-GPG_PORT=16448
 REMOTE_SOCAT_PID=""
 
 # Remote cleanup function
 remote_cleanup() {
+  # prevent double execution
+  if [ -n "\$CLEANUP_RAN" ]; then
+    return 0
+  fi
+  CLEANUP_RAN=1
+
   echo "Cleaning up remote resources"
-  if [ -n "$REMOTE_SOCAT_PID" ]; then
-    kill $REMOTE_SOCAT_PID 2>/dev/null || true
+  if [ -n "\$REMOTE_SOCAT_PID" ]; then
+    kill \$REMOTE_SOCAT_PID 2>/dev/null || true
   fi
   # Kill any other socat processes that might be related
   pkill -f "socat.*gnupg.*${GPG_PORT}" 2>/dev/null || true
   echo "Remote GPG forwarding stopped"
+
+  # Delete this script itself
+  # param 0 reliable since calling this script with an absolute path in SSH command
+  rm -f "\$0"
+
+  # already exiting, no need to reset CLEANUP_RAN
   exit 0
 }
 
@@ -161,16 +195,16 @@ remote_cleanup() {
 trap remote_cleanup EXIT SIGINT SIGTERM
 
 # Setup directories
-mkdir -p ~/.gnupg /run/user/$(id -u)/gnupg
-chmod 700 ~/.gnupg /run/user/$(id -u)/gnupg
+mkdir -p ~/.gnupg /run/user/\$(id -u)/gnupg
+chmod 700 ~/.gnupg /run/user/\$(id -u)/gnupg
 
 # Kill any existing socat processes
 pkill -f "socat.*gnupg.*${GPG_PORT}" || true
 
 # Create a Unix socket that forwards to the TCP port
-socat UNIX-LISTEN:/run/user/$(id -u)/gnupg/S.gpg-agent,fork,unlink-early,mode=600 \
+socat UNIX-LISTEN:/run/user/\$(id -u)/gnupg/S.gpg-agent,fork,unlink-early,mode=600 \\
     TCP:localhost:${GPG_PORT} &
-REMOTE_SOCAT_PID=$!
+REMOTE_SOCAT_PID=\$!
 
 # Add no-autostart to gpg.conf if not already present
 if ! grep -q "^no-autostart" ~/.gnupg/gpg.conf 2>/dev/null; then
@@ -181,14 +215,14 @@ fi
 # Wait for socat socket to be ready
 echo "Waiting up to 5s for remote socket to be ready"
 MAX_TRIES=10
-for ((i=1; i<=$MAX_TRIES; i++)); do
-  if [ -S "/run/user/$(id -u)/gnupg/S.gpg-agent" ]; then
+for ((i=1; i<=\$MAX_TRIES; i++)); do
+  if [ -S "/run/user/\$(id -u)/gnupg/S.gpg-agent" ]; then
     # GPG socket is ready
     break
   fi
 
-  if [ $i -eq $MAX_TRIES ]; then
-    echo "⚠️ WARNING: Socket not ready after $MAX_TRIES attempts" >&2
+  if [ \$i -eq \$MAX_TRIES ]; then
+    echo "⚠️ WARNING: Socket not ready after \$MAX_TRIES attempts" >&2
     echo "Continuing anyway, but connection may fail" >&2
   fi
 
@@ -197,19 +231,19 @@ done
 
 # Verify GPG agent connection
 echo "Verify GPG agent connection"
-GPG_AGENT_RESPONSE=$(gpg-connect-agent "getinfo version" /bye)
-if echo "$GPG_AGENT_RESPONSE" | grep -q "OK"; then
+GPG_AGENT_RESPONSE=\$(gpg-connect-agent "getinfo version" /bye)
+if echo "\$GPG_AGENT_RESPONSE" | grep -q "OK"; then
   echo "✅ GPG forwarding connection verified. You can use remote GPG with local keys."
 else
   echo "⚠️ WARNING: GPG agent connection could not be verified" >&2
-  echo "Response was: $GPG_AGENT_RESPONSE" >&2
+  echo "Response was: \$GPG_AGENT_RESPONSE" >&2
 fi
 
 echo ""
 echo "Press Ctrl+C to stop forwarding and exit"
 
 # Wait for socat to exit (or be killed)
-wait $REMOTE_SOCAT_PID
+wait \$REMOTE_SOCAT_PID
 EOF
 
 chmod +x "$TMP_SCRIPT"
@@ -218,8 +252,8 @@ chmod +x "$TMP_SCRIPT"
 # GPG Agent is now available via TCP at localhost
 echo "Connect to $REMOTE_HOST and setup remote forwarding"
 
-# Copy script to remote host and execute it over SSH with port forwarding
-if ! scp -q "$TMP_SCRIPT" "$REMOTE_HOST:/tmp/gpg-forward-remote.sh"; then
+# Copy script to remote host with port-specific name
+if ! scp -q "$TMP_SCRIPT" "$REMOTE_HOST:$REMOTE_SCRIPT"; then
   echo "❌ ERROR: Failed to transfer setup script to $REMOTE_HOST"
   exit 1
 fi
@@ -237,7 +271,7 @@ if [ "$FORK_MODE" = true ]; then
 
   # Launch SSH in background, redirecting output to log file
   {
-    ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "/tmp/gpg-forward-remote.sh" > "$LOG_FILE" 2>&1
+    ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "$REMOTE_SCRIPT" > "$LOG_FILE" 2>&1
 
     # Try to kill remote socat even if the remote script failed to do so
     ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true" >> "$LOG_FILE" 2>&1
@@ -255,7 +289,7 @@ if [ "$FORK_MODE" = true ]; then
   exit 0
 else
   # Original non-forking behavior
-  ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "/tmp/gpg-forward-remote.sh"
+  ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "$REMOTE_SCRIPT"
 
   # Try to kill remote socat even if the remote script failed to do so
   ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true"
