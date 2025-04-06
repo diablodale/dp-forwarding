@@ -6,43 +6,35 @@ EXPORT_EMAIL=""
 
 # Check dependencies
 function app_version_lt_min() {
-  if test "$(echo -e "$2\n$3" | sort -rV | head -n 1)" != "$2"; then
+  if [[ "$(echo -e "$2\n$3" | sort -rV | head -n 1)" != "$2" ]]; then
     echo "❌ ERROR: $1 is older than $3, please update it"
     exit 1
   fi
 }
-function install_linux() {
+function check_cmd() {
   if ! command -v "$1" &>/dev/null; then
     echo "❌ ERROR: $1 is not installed"
     echo "Please install it with your package manager:"
-    echo "  Ubuntu/Debian: sudo apt install $2"
-    echo "  Fedora: sudo dnf install $2"
-    echo "  Alpine: sudo apk add $2"
-    echo "  Arch: sudo pacman -S $2"
+    if [[ "$cmd" == *".exe" ]]; then
+      echo "  winget install $2"
+      echo "After installation, make sure it's in your PATH."
+    else
+      echo "  Ubuntu/Debian: sudo apt install $2"
+      echo "  Fedora: sudo dnf install $2"
+      echo "  Alpine: sudo apk add $2"
+      echo "  Arch: sudo pacman -S $2"
+    fi
     exit 1
   fi
   if [[ -n "${3-}" && -n "${4-}" ]]; then
     app_version_lt_min "$1" "$3" "$4"
   fi
 }
-function install_windows() {
-  if ! command -v $1 &>/dev/null; then
-    echo "❌ ERROR: $1 is not installed or not in PATH"
-    echo "Please install it in Windows:"
-    echo "  winget install $2"
-    echo ""
-    echo "After installation, make sure it's in your PATH."
-    exit 1
-  fi
-  if [[ -n "${3-}" && -n "${4-}" ]]; then
-    app_version_lt_min "$1" "$3" "$4"
-  fi
-}
-install_linux gpg gpg "$(gpg --version | head -n 1 | awk '{print $3}')" "2.1.13"
-install_linux socat socat
-install_linux ssh openssh-client
-install_linux scp openssh-client
-install_windows npiperelay.exe albertony.npiperelay "$(npiperelay.exe -v 2>&1 | head -n 1 | awk '{gsub("v","",$2); print $2}')" "1.8.0"
+check_cmd gpg gpg "$(gpg --version | head -n 1 | awk '{print $3}')" "2.1.3"
+check_cmd socat socat
+check_cmd ssh openssh-client
+check_cmd scp openssh-client
+check_cmd npiperelay.exe albertony.npiperelay "$(npiperelay.exe -v 2>&1 | head -n 1 | awk '{gsub("v","",$2); print $2}')" "1.8.0"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
