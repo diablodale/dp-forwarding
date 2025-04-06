@@ -33,7 +33,7 @@ function check_cmd() {
   fi
 }
 check_cmd gpg gpg "$(gpg --version | head -n 1 | awk '{print $3}')" "2.1.3"
-check_cmd socat socat
+check_cmd socat socat # developed with 1.8.0.0
 check_cmd ssh openssh-client
 check_cmd scp openssh-client
 check_cmd npiperelay.exe albertony.npiperelay "$(npiperelay.exe -v 2>&1 | head -n 1 | awk '{gsub("v","",$2); print $2}')" "1.8.0"
@@ -148,14 +148,15 @@ cleanup() {
 }
 
 # Register cleanup on script exit and signals
-trap cleanup EXIT SIGINT SIGTERM
+trap 'cleanup; exit 0' INT
+trap cleanup EXIT TERM
 
-# Kill any existing socat processes
-pkill -f "socat.*gpg-agent" || true
+# Kill any existing socat processes for the chosen port
+pkill -f "socat.*${GPG_PORT}.*gpg-agent" || true
 
 # Start socat for main GPG agent socket - forward Windows socket to TCP port
 echo "Start npiperelay for local named pipe -> TCP socket"
-socat TCP4-LISTEN:${GPG_PORT},bind=localhost,fork,reuseaddr \
+socat -d0 TCP4-LISTEN:${GPG_PORT},bind=localhost,fork,reuseaddr \
     EXEC:"npiperelay.exe -ei -ep -a \"${WIN_ASSUAN_FILE}\"" &
 SOCAT_PID=$!
 
@@ -166,12 +167,16 @@ REMOTE_SCRIPT="/tmp/gpg-forward-remote-${GPG_PORT}.sh"
 cat > "$TMP_SCRIPT" << EOF
 #!/bin/bash
 REMOTE_SOCAT_PID=""
+CLEANUP_RAN=""
 
 # Remote cleanup function
 remote_cleanup() {
-  # prevent double execution
+  # Save the original exit code that triggered this trap
+  local exit_code=\$?
+
+  # Prevent double execution
   if [ -n "\$CLEANUP_RAN" ]; then
-    return 0
+    return \$exit_code
   fi
   CLEANUP_RAN=1
 
@@ -179,20 +184,21 @@ remote_cleanup() {
   if [ -n "\$REMOTE_SOCAT_PID" ]; then
     kill \$REMOTE_SOCAT_PID 2>/dev/null || true
   fi
-  # Kill any other socat processes that might be related
-  pkill -f "socat.*gnupg.*${GPG_PORT}" 2>/dev/null || true
+
+  # Kill any other socat processes using a port-specific pattern
+  pkill -f "socat.*localhost:${GPG_PORT}" 2>/dev/null || true
   echo "Remote GPG forwarding stopped"
 
   # Delete this script itself
   # param 0 reliable since calling this script with an absolute path in SSH command
   rm -f "\$0"
 
-  # already exiting, no need to reset CLEANUP_RAN
-  exit 0
+  # Use the original exit code
+  exit \$exit_code
 }
 
 # Register remote cleanup for all exit scenarios
-trap remote_cleanup EXIT SIGINT SIGTERM
+trap remote_cleanup EXIT INT TERM
 
 # Setup directories
 mkdir -p ~/.gnupg /run/user/\$(id -u)/gnupg
@@ -202,7 +208,7 @@ chmod 700 ~/.gnupg /run/user/\$(id -u)/gnupg
 pkill -f "socat.*gnupg.*${GPG_PORT}" || true
 
 # Create a Unix socket that forwards to the TCP port
-socat UNIX-LISTEN:/run/user/\$(id -u)/gnupg/S.gpg-agent,fork,unlink-early,mode=600 \\
+socat -d0 UNIX-LISTEN:/run/user/\$(id -u)/gnupg/S.gpg-agent,fork,unlink-early,mode=600 \\
     TCP:localhost:${GPG_PORT} &
 REMOTE_SOCAT_PID=\$!
 
@@ -258,42 +264,74 @@ if ! scp -q "$TMP_SCRIPT" "$REMOTE_HOST:$REMOTE_SCRIPT"; then
   exit 1
 fi
 
-# Use Remote forwarding with additional options:
+# Use ssh remote forwarding with additional options:
 # -t: Force terminal allocation to ensure signals are properly forwarded
-# This pushes the local GPG port to the remote machine
+#     This pushes the local GPG port to the remote machine
 if [ "$FORK_MODE" = true ]; then
   # not yet ready
   echo "❌ ERROR: Fork mode is not yet implemented"
   exit 1
 
-  # Create a log file for the forked process
-  LOG_FILE="/tmp/gpg-forward-${REMOTE_HOST}-$(date +%s).log"
+  # Create log and pid files for the forked process with port-specific name
+  LOG_FILE="/tmp/gpg-forward-${REMOTE_HOST}-${GPG_PORT}.log"
+  PID_FILE="/tmp/gpg-forward-${REMOTE_HOST}-${GPG_PORT}.pid"
 
-  # Launch SSH in background, redirecting output to log file
+  # Launch SSH in background with port-specific script
   {
     ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "$REMOTE_SCRIPT" > "$LOG_FILE" 2>&1
 
-    # Try to kill remote socat even if the remote script failed to do so
-    ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true" >> "$LOG_FILE" 2>&1
+    # kill remote socat with port-specific pattern even if remote script failed to do so
+    ssh "$REMOTE_HOST" "pkill -f 'socat.*localhost:${GPG_PORT}'" >> "$LOG_FILE" 2>&1 || true
 
     echo "SSH connection closed" >> "$LOG_FILE"
+
+    # TODO cleanup, remove pid file, etc.
   } &
 
-  # Store PID in a file for potential later management
-  PID_FILE="/tmp/gpg-forward-${REMOTE_HOST}.pid"
-  echo $! > "$PID_FILE"
+  # Store PID in a file with port-specific name
+  SSH_PID=$!
+  echo $SSH_PID > "$PID_FILE"
 
-  echo "✅ GPG forwarding started in background (PID: $!)"
+  # Print status
   echo "Log file: $LOG_FILE"
-  echo "To terminate: kill $(cat "$PID_FILE")"
+  echo "PID file: $PID_FILE"
+  echo "To terminate: kill $SSH_PID"
+  echo "✅ GPG forwarding started in background (PID: $SSH_PID)"
   exit 0
-else
-  # Original non-forking behavior
-  ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "$REMOTE_SCRIPT"
-
-  # Try to kill remote socat even if the remote script failed to do so
-  ssh "$REMOTE_HOST" "pkill -f 'socat.*gnupg.*${GPG_PORT}' || true"
-
-  # No need for cleanup here as the trap will handle it
-  echo "SSH connection closed"
 fi
+
+# non-forking behavior
+# Temporarily disable the "exit on error" behavior
+set +e
+ssh -t -R localhost:${GPG_PORT}:localhost:${GPG_PORT} "$REMOTE_HOST" "$REMOTE_SCRIPT"
+SSH_EXIT=$?
+set -e
+
+# Better handling of SSH errors vs. Ctrl+C
+if [ $SSH_EXIT -eq 130 ]; then
+  # SIGINT (Ctrl+C) - intentional user interruption
+  echo "GPG forwarding stopped by user (SIGINT)"
+  FINAL_EXIT=0
+elif [ $SSH_EXIT -eq 255 ]; then
+  # Check if our socat process is still running
+  if kill -0 $SOCAT_PID 2>/dev/null; then
+    # Our socat is still running, suggesting this wasn't a normal termination
+    echo "❌ ERROR: SSH connection failed with code 255"
+    echo "This may indicate network issues or authentication problems."
+    FINAL_EXIT=255
+  else
+    # socat was terminated, suggesting normal termination via signal
+    echo "GPG forwarding stopped (connection terminated)"
+    FINAL_EXIT=0
+  fi
+else
+  # Any other exit code
+  echo "SSH connection closed with code $SSH_EXIT"
+  FINAL_EXIT=$SSH_EXIT
+fi
+
+# kill remote socat with port-specific pattern even if remote script failed to do so
+ssh "$REMOTE_HOST" "pkill -f 'socat.*localhost:${GPG_PORT}'" || true
+
+# Exit with the appropriate code
+exit $FINAL_EXIT
