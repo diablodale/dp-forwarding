@@ -71,12 +71,42 @@ if [ -z "${REMOTE_HOST:-}" ]; then
   exit 1
 fi
 
+# Function to check if a port is available
+check_port_available() {
+  local port=$1
+
+  # Method 1: Try ss (fastest and most modern)
+  if command -v ss &>/dev/null; then
+    if ! ss -lnt | awk '{print $4}' | grep -q ":$port\$"; then
+      return 0  # Port is available
+    else
+      return 1  # Port is in use
+    fi
+  fi
+
+  # Method 2: Try netstat (widely available)
+  if command -v netstat &>/dev/null; then
+    if ! netstat -tuln | grep -q ":$port "; then
+      return 0  # Port is available
+    else
+      return 1  # Port is in use
+    fi
+  fi
+
+  # Method 3: Pure Bash /dev/tcp approach (invasive)
+  if ! (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+    return 0  # Port is available (connection failed)
+  else
+    return 1  # Port is in use (connection succeeded)
+  fi
+}
+
 # Handle port selection
 if [[ "$GPG_PORT" == "auto" ]]; then
   # Find a free port in the dynamic/private range (49152-65535)
   while true; do
     SELECTED_PORT=$(shuf -i 49152-65535 -n 1)
-    if ! ss -lnt | awk '{print $4}' | grep -q ":$SELECTED_PORT\$"; then
+    if check_port_available "$SELECTED_PORT"; then
       GPG_PORT=$SELECTED_PORT
       echo "Selected TCP port: $GPG_PORT"
       break
@@ -90,8 +120,17 @@ fi
 # Find Windows GPG agent socket path and convert it correctly
 ASSUAN_FILE="$(find /mnt/c/Users/${USER}/AppData/local/gnupg -iname S.gpg-agent)"
 if [ -z "$ASSUAN_FILE" ]; then
-  echo "❌ ERROR: Could not find the GPG agent socket file"
+  echo "❌ ERROR: Could not find the GPG agent socket file in Windows."
   echo "Check if the GPG agent is running in Windows."
+  exit 1
+fi
+WIN_ASSUAN_FILE="$(wslpath -w "$ASSUAN_FILE")"
+
+# Verify GPG agent running in Windows
+GPG_AGENT_RESPONSE=$(gpg-connect-agent.exe --no-autostart "getinfo version" /bye 2> /dev/null)
+if ! echo "$GPG_AGENT_RESPONSE" | grep -q "OK"; then
+  echo "❌ ERROR: GPG agent is not running in Windows."
+  echo "Please start Kleopatra or WinGPG and try again."
   exit 1
 fi
 
@@ -116,7 +155,6 @@ if [ -n "$EXPORT_EMAIL" ]; then
   fi
 
   # Display key information
-  # gpg --show-keys "$PUBKEY_FILE"
   echo "GPG keys exported for $EXPORT_EMAIL locally"
 
   # Send the public keys to the remote host
@@ -139,12 +177,6 @@ if [ -n "$EXPORT_EMAIL" ]; then
   echo ""
 fi
 
-# Convert path for npiperelay - using a different approach
-# First get Windows style path with wslpath
-WIN_PATH="$(wslpath -w "$ASSUAN_FILE")"
-# Then properly escape backslashes for command line
-WIN_ASSUAN_FILE=$(echo "$WIN_PATH" | sed 's/\\/\\\\\\\\/g')
-
 # Setup cleanup function
 cleanup() {
   echo "Cleaning up local resources"
@@ -161,9 +193,11 @@ trap cleanup EXIT TERM
 pkill -f "socat.*${GPG_PORT}.*npiperelay.*gpg-agent" || true
 
 # Start socat for main GPG agent socket - forward Windows socket to TCP port
+# properly escape backslashes for socat
 echo "Start npiperelay for local named pipe -> TCP socket"
+SOCAT_ASSUAN_FILE=$(echo "$WIN_ASSUAN_FILE" | sed 's/\\/\\\\\\\\/g')
 socat -d0 TCP4-LISTEN:${GPG_PORT},bind=localhost,fork,reuseaddr \
-    EXEC:"npiperelay.exe -ei -ep -a \"${WIN_ASSUAN_FILE}\"" &
+    EXEC:"npiperelay.exe -ei -ep -a \"${SOCAT_ASSUAN_FILE}\"" &
 SOCAT_PID=$!
 
 # Create remote setup script with port-specific filename

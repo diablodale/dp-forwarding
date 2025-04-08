@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-# use this by creating an entry in ~/.ssh/config
+# attempting to https://code.visualstudio.com/docs/remote/troubleshooting with ProxyCommand
+# to automatically forward GPG agent to remote server when workspace is opened
+# perhaps create entry in ~/.ssh/config
 # Host vscode-gpg-myserver
 #     HostName actual-server-address
 #     User your-username
