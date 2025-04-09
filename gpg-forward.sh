@@ -155,7 +155,7 @@ if [ -n "$EXPORT_EMAIL" ]; then
   fi
 
   # Display key information
-  echo "GPG keys exported for $EXPORT_EMAIL locally"
+  echo "GPG public keys exported locally for $EXPORT_EMAIL"
 
   # Send the public keys to the remote host
   # echo "Transferring public keys to $REMOTE_HOST"
@@ -172,7 +172,7 @@ if [ -n "$EXPORT_EMAIL" ]; then
     exit 1
   fi
 
-  echo "✅ GPG keys imported for $EXPORT_EMAIL remotely on $REMOTE_HOST"
+  echo "✅ GPG public keys imported on $REMOTE_HOST for $EXPORT_EMAIL"
   rm -rf "$TMP_KEY_DIR"
   echo ""
 fi
@@ -259,8 +259,8 @@ if ! grep -q "^no-autostart" ~/.gnupg/gpg.conf 2>/dev/null; then
 fi
 
 # Wait for socat socket to be ready
-echo "Waiting up to 5s for remote socket to be ready"
 MAX_TRIES=10
+echo "Waiting up to \$((MAX_TRIES / 2))s for gpg socket on $REMOTE_HOST to be ready"
 for ((i=1; i<=\$MAX_TRIES; i++)); do
   if [ -S "/run/user/\$(id -u)/gnupg/S.gpg-agent" ]; then
     # GPG socket is ready
@@ -268,21 +268,20 @@ for ((i=1; i<=\$MAX_TRIES; i++)); do
   fi
 
   if [ \$i -eq \$MAX_TRIES ]; then
-    echo "⚠️ WARNING: Socket not ready after \$MAX_TRIES attempts" >&2
-    echo "Continuing anyway, but connection may fail" >&2
+    echo "❌ ERROR: Socket not ready on $REMOTE_HOST after repeated attempts" >&2
+    exit 1
   fi
 
-  sleep 0.5
+  sleep 0.5s
 done
 
 # Verify GPG agent connection
-echo "Verify GPG agent connection"
 GPG_AGENT_RESPONSE=\$(gpg-connect-agent "getinfo version" /bye)
 if echo "\$GPG_AGENT_RESPONSE" | grep -q "OK"; then
-  echo "✅ GPG forwarding connection verified. You can use remote GPG with local keys."
+  echo "✅ GPG agent forwarding to $REMOTE_HOST verified. You can use GPG with local private keys."
 else
-  echo "⚠️ WARNING: GPG agent connection could not be verified" >&2
-  echo "Response was: \$GPG_AGENT_RESPONSE" >&2
+  echo "❌ ERROR: GPG agent forwarding to $REMOTE_HOST could not be verified" >&2
+  exit 1
 fi
 
 echo ""
@@ -336,7 +335,7 @@ if [ "$FORK_MODE" = true ]; then
   echo "Log file: $LOG_FILE"
   echo "PID file: $PID_FILE"
   echo "To terminate: kill $SSH_PID"
-  echo "✅ GPG forwarding started in background (PID: $SSH_PID)"
+  echo "✅ GPG agent forwarding started in background (PID: $SSH_PID)"
   exit 0
 fi
 
