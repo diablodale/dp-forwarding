@@ -38,7 +38,7 @@ function check_cmd() {
     app_version_lt_min "$1" "$3" "$4"
   fi
 }
-check_cmd gpg gpg "$(gpg --version | head -n 1 | awk '{print $3}')" "2.1.3"
+check_cmd gpg gpg "$(gpg --version | head -n 1 | awk '{print $3}')" "2.3.0"
 check_cmd socat socat # developed with 1.8.0.0
 check_cmd ssh openssh-client
 check_cmd scp openssh-client
@@ -136,44 +136,116 @@ fi
 
 # Export keys if requested
 if [ -n "$EXPORT_EMAIL" ]; then
-  # Create a temporary directory for key export
-  TMP_KEY_DIR=$(mktemp -d)
-  PUBKEY_FILE="$TMP_KEY_DIR/pubkey.asc"
+  # Create temporary files with descriptive names
+  PUBKEY_FILE=$(mktemp -t "gpg-pubkey-${EXPORT_EMAIL}-XXXXXXXX")
+  VERIFY_SCRIPT=$(mktemp -t "gpg-verify-script-${EXPORT_EMAIL}-XXXXXXXX")
+
+  # Create the verification script
+  cat > "$VERIFY_SCRIPT" << 'EOFVERIFY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Path to the public key file passed as argument
+PUBKEY_FILE="$1"
+
+# Function to check version requirements
+app_version_lt_min() {
+  local app_name=$1
+  local current_ver=$2
+  local min_ver=$3
+
+  if [[ "$(echo -e "$current_ver\n$min_ver" | sort -rV | head -n 1)" != "$current_ver" ]]; then
+    echo "❌ ERROR: $app_name version $current_ver is older than minimum required version $min_ver"
+    echo "Please update $app_name on the remote host"
+    exit 1
+  fi
+}
+
+# Function to check command availability
+check_remote_cmd() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "❌ ERROR: $1 is not installed on remote host"
+    echo "Please install it with your package manager:"
+    echo "  Ubuntu/Debian: sudo apt install $2"
+    echo "  Fedora: sudo dnf install $2"
+    echo "  Alpine: sudo apk add $2"
+    echo "  Arch: sudo pacman -S $2"
+    exit 1
+  fi
+
+  # Check version if version arguments are provided
+  if [[ -n "${3-}" && -n "${4-}" ]]; then
+    app_version_lt_min "$1" "$3" "$4"
+  fi
+}
+
+# Check for required commands with version checks
+check_remote_cmd gpg gpg "$(gpg --version 2>/dev/null | head -n 1 | awk '{print $3}')" "2.3.0"
+check_remote_cmd socat socat
+
+# Launch keyboxd
+if command -v gpgconf &>/dev/null; then
+  # kill components as could be running in another session and lock the db
+  gpgconf --kill gpg-agent
+  gpgconf --kill keyboxd
+  gpgconf --launch keyboxd
+fi
+
+# Import the public key
+if ! gpg --import "$PUBKEY_FILE"; then
+  echo "❌ ERROR: Failed to import GPG key on remote host"
+  exit 1
+fi
+
+# Verify key was imported
+if ! gpg --list-keys | grep -q "$(gpg --list-packets < "$PUBKEY_FILE" | grep -i "keyid" | head -1 | awk '{print $NF}')"; then
+  echo "❌ ERROR: Could not verify key was imported correctly"
+  exit 1
+fi
+
+# Cleanup
+rm -f "$PUBKEY_FILE"
+exit 0
+EOFVERIFY
+
+  chmod +x "$VERIFY_SCRIPT"
 
   # Export public keys
   if ! gpg --export --armor "$EXPORT_EMAIL" > "$PUBKEY_FILE"; then
     echo "❌ ERROR: Failed to export public keys for $EXPORT_EMAIL"
-    rm -rf "$TMP_KEY_DIR"
+    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
     exit 1
   fi
 
   # Check if the export was successful
   if [ ! -s "$PUBKEY_FILE" ]; then
     echo "❌ ERROR: No public keys found for $EXPORT_EMAIL"
-    rm -rf "$TMP_KEY_DIR"
+    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
     exit 1
   fi
-
-  # Display key information
   echo "GPG public keys exported locally for $EXPORT_EMAIL"
 
-  # Send the public keys to the remote host
-  # echo "Transferring public keys to $REMOTE_HOST"
-  if ! scp -q "$PUBKEY_FILE" "$REMOTE_HOST:/tmp/pubkey.asc"; then
-    echo "❌ ERROR: Failed to transfer public keys to $REMOTE_HOST"
-    rm -rf "$TMP_KEY_DIR"
+  # Send both files to the remote host
+  echo "Transferring files to $REMOTE_HOST"
+  if ! scp -q "$PUBKEY_FILE" "$VERIFY_SCRIPT" "${REMOTE_HOST}:/tmp/"; then
+    echo "❌ ERROR: Failed to transfer files to $REMOTE_HOST"
+    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
     exit 1
   fi
 
-  # Import the public keys on the remote host
-  if ! ssh "$REMOTE_HOST" "gpg --import /tmp/pubkey.asc && rm -f /tmp/pubkey.asc"; then
-    echo "❌ ERROR: Failed to import public keys on $REMOTE_HOST"
-    rm -rf "$TMP_KEY_DIR"
+  # Run the verification script on the remote host
+  if ! ssh "$REMOTE_HOST" "${VERIFY_SCRIPT} ${PUBKEY_FILE}"; then
+    echo "❌ ERROR: Failed to configure GPG on $REMOTE_HOST"
+    # Try to clean up remote files
+    ssh "$REMOTE_HOST" "rm -f ${VERIFY_SCRIPT} ${PUBKEY_FILE}" 2>/dev/null || true
+    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
     exit 1
   fi
+
+  # Clean up local files
+  rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
 
   echo "✅ GPG public keys imported on $REMOTE_HOST for $EXPORT_EMAIL"
-  rm -rf "$TMP_KEY_DIR"
   echo ""
 fi
 
