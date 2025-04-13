@@ -134,126 +134,11 @@ if ! echo "$GPG_AGENT_RESPONSE" | grep -q "OK"; then
   exit 1
 fi
 
-# Export keys if requested
-if [ -n "$EXPORT_EMAIL" ]; then
-  # Create temporary files with descriptive names
-  PUBKEY_FILE=$(mktemp -t "gpg-pubkey-${EXPORT_EMAIL}-XXXXXXXX")
-  VERIFY_SCRIPT=$(mktemp -t "gpg-verify-script-${EXPORT_EMAIL}-XXXXXXXX")
-
-  # Create the verification script
-  cat > "$VERIFY_SCRIPT" << 'EOFVERIFY'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Path to the public key file passed as argument
-PUBKEY_FILE="$1"
-
-# Function to check version requirements
-app_version_lt_min() {
-  local app_name=$1
-  local current_ver=$2
-  local min_ver=$3
-
-  if [[ "$(echo -e "$current_ver\n$min_ver" | sort -rV | head -n 1)" != "$current_ver" ]]; then
-    echo "❌ ERROR: $app_name version $current_ver is older than minimum required version $min_ver"
-    echo "Please update $app_name on the remote host"
-    exit 1
-  fi
-}
-
-# Function to check command availability
-check_remote_cmd() {
-  if ! command -v "$1" &>/dev/null; then
-    echo "❌ ERROR: $1 is not installed on remote host"
-    echo "Please install it with your package manager:"
-    echo "  Ubuntu/Debian: sudo apt install $2"
-    echo "  Fedora: sudo dnf install $2"
-    echo "  Alpine: sudo apk add $2"
-    echo "  Arch: sudo pacman -S $2"
-    exit 1
-  fi
-
-  # Check version if version arguments are provided
-  if [[ -n "${3-}" && -n "${4-}" ]]; then
-    app_version_lt_min "$1" "$3" "$4"
-  fi
-}
-
-# Check for required commands with version checks
-check_remote_cmd gpg gpg "$(gpg --version 2>/dev/null | head -n 1 | awk '{print $3}')" "2.3.0"
-check_remote_cmd socat socat
-
-# Launch keyboxd
-if command -v gpgconf &>/dev/null; then
-  # kill components as could be running in another session and lock the db
-  gpgconf --kill gpg-agent
-  gpgconf --kill keyboxd
-  gpgconf --launch keyboxd
-fi
-
-# Import the public key
-if ! gpg --import "$PUBKEY_FILE"; then
-  echo "❌ ERROR: Failed to import GPG key on remote host"
-  exit 1
-fi
-
-# Verify key was imported
-if ! gpg --list-keys | grep -q "$(gpg --list-packets < "$PUBKEY_FILE" | grep -i "keyid" | head -1 | awk '{print $NF}')"; then
-  echo "❌ ERROR: Could not verify key was imported correctly"
-  exit 1
-fi
-
-# Cleanup
-rm -f "$PUBKEY_FILE"
-exit 0
-EOFVERIFY
-
-  chmod +x "$VERIFY_SCRIPT"
-
-  # Export public keys
-  if ! gpg --export --armor "$EXPORT_EMAIL" > "$PUBKEY_FILE"; then
-    echo "❌ ERROR: Failed to export public keys for $EXPORT_EMAIL"
-    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
-    exit 1
-  fi
-
-  # Check if the export was successful
-  if [ ! -s "$PUBKEY_FILE" ]; then
-    echo "❌ ERROR: No public keys found for $EXPORT_EMAIL"
-    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
-    exit 1
-  fi
-  echo "GPG public keys exported locally for $EXPORT_EMAIL"
-
-  # Send both files to the remote host
-  echo "Transferring files to $REMOTE_HOST"
-  if ! scp -q "$PUBKEY_FILE" "$VERIFY_SCRIPT" "${REMOTE_HOST}:/tmp/"; then
-    echo "❌ ERROR: Failed to transfer files to $REMOTE_HOST"
-    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
-    exit 1
-  fi
-
-  # Run the verification script on the remote host
-  if ! ssh "$REMOTE_HOST" "${VERIFY_SCRIPT} ${PUBKEY_FILE}"; then
-    echo "❌ ERROR: Failed to configure GPG on $REMOTE_HOST"
-    # Try to clean up remote files
-    ssh "$REMOTE_HOST" "rm -f ${VERIFY_SCRIPT} ${PUBKEY_FILE}" 2>/dev/null || true
-    rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
-    exit 1
-  fi
-
-  # Clean up local files
-  rm -f "$PUBKEY_FILE" "$VERIFY_SCRIPT"
-
-  echo "✅ GPG public keys imported on $REMOTE_HOST for $EXPORT_EMAIL"
-  echo ""
-fi
-
 # Setup cleanup function
 cleanup() {
-  echo "Cleaning up local resources"
-  kill $SOCAT_PID 2>/dev/null || true
-  rm -f "$TMP_SCRIPT" 2>/dev/null || true
+  echo "Cleaning local resources"
+  kill ${LOCAL_SOCAT_PID:-} 2>/dev/null || true
+  rm -f "${LOCAL_SCRIPT:-}" "${PUBKEY_FILE:-}" 2>/dev/null || true
   echo "Local GPG forwarding stopped"
 }
 
@@ -261,25 +146,73 @@ cleanup() {
 trap 'cleanup; exit 0' INT
 trap cleanup EXIT TERM
 
-# Kill any existing socat processes for the chosen port
-pkill -f "socat.*${GPG_PORT}.*npiperelay.*gpg-agent" || true
+# Export keys and setup remote forwarding
+LOCAL_SCRIPT=$(mktemp)
+REMOTE_SCRIPT=$(mktemp -t "gpg-forward-remote-${GPG_PORT}-XXXXXXXX")
 
-# Start socat for main GPG agent socket - forward Windows socket to TCP port
-# properly escape backslashes for socat
-echo "Start npiperelay for local named pipe -> TCP socket"
-SOCAT_ASSUAN_FILE=$(echo "$WIN_ASSUAN_FILE" | sed 's/\\/\\\\\\\\/g')
-socat -d0 TCP4-LISTEN:${GPG_PORT},bind=localhost,fork,reuseaddr \
-    EXEC:"npiperelay.exe -ei -ep -a \"${SOCAT_ASSUAN_FILE}\"" &
-SOCAT_PID=$!
+# Export public keys if requested
+if [ -n "$EXPORT_EMAIL" ]; then
+  PUBKEY_FILE=$(mktemp -t "gpg-pubkey-${EXPORT_EMAIL}-XXXXXXXX")
 
-# Create remote setup script with port-specific filename
-TMP_SCRIPT=$(mktemp)
-REMOTE_SCRIPT="/tmp/gpg-forward-remote-${GPG_PORT}.sh"
+  # Export public keys
+  if ! gpg --export --armor "$EXPORT_EMAIL" > "$PUBKEY_FILE"; then
+    echo "❌ ERROR: Failed to export public keys for $EXPORT_EMAIL"
+    exit 1
+  fi
 
-cat > "$TMP_SCRIPT" << EOF
+  # Check if the export was successful
+  if [ ! -s "$PUBKEY_FILE" ]; then
+    echo "❌ ERROR: No public keys found for $EXPORT_EMAIL"
+    exit 1
+  fi
+  echo "GPG public keys exported locally for $EXPORT_EMAIL"
+
+  # Base64 encode the pubkey for embedding in script
+  PUBKEY_BASE64=$(base64 -w0 "$PUBKEY_FILE")
+else
+  PUBKEY_BASE64=""
+fi
+
+# Create the comprehensive remote script
+cat > "$LOCAL_SCRIPT" << EOF
 #!/bin/bash
+set -euo pipefail
+
+# Configuration
 REMOTE_SOCAT_PID=""
 CLEANUP_RAN=""
+PUBKEY_FILE=""
+
+# Function to check version requirements
+app_version_lt_min() {
+  local app_name=\$1
+  local current_ver=\$2
+  local min_ver=\$3
+
+  if [[ "\$(echo -e "\$current_ver\n\$min_ver" | sort -rV | head -n 1)" != "\$current_ver" ]]; then
+    echo "❌ ERROR: \$app_name version \$current_ver is older than minimum required version \$min_ver"
+    echo "Please update \$app_name on the remote host"
+    exit 1
+  fi
+}
+
+# Function to check command availability
+check_remote_cmd() {
+  if ! command -v "\$1" &>/dev/null; then
+    echo "❌ ERROR: \$1 is not installed on ${REMOTE_HOST}"
+    echo "Please install it with your package manager on ${REMOTE_HOST}:"
+    echo "  Ubuntu/Debian: sudo apt install \$2"
+    echo "  Fedora: sudo dnf install \$2"
+    echo "  Alpine: sudo apk add \$2"
+    echo "  Arch: sudo pacman -S \$2"
+    exit 1
+  fi
+
+  # Check version if version arguments are provided
+  if [[ -n "\${3-}" && -n "\${4-}" ]]; then
+    app_version_lt_min "\$1" "\$3" "\$4"
+  fi
+}
 
 # Remote cleanup function
 remote_cleanup() {
@@ -292,13 +225,23 @@ remote_cleanup() {
   fi
   CLEANUP_RAN=1
 
-  echo "Cleaning up remote resources"
+  echo "Cleaning remote resources"
+
+  # Clean temporary files and GPG components
+  if [ -n "\${PUBKEY_FILE:-}" ]; then
+    rm -f "\$PUBKEY_FILE" 2>/dev/null || true
+    gpgconf --kill gpg-agent 2>/dev/null || true
+    gpgconf --kill keyboxd 2>/dev/null || true
+  fi
+
+  # Kill socat process
   if [ -n "\$REMOTE_SOCAT_PID" ]; then
     kill \$REMOTE_SOCAT_PID 2>/dev/null || true
   fi
 
   # Kill any other socat processes using a port-specific pattern
   pkill -f "socat.*gpg-agent.*localhost:${GPG_PORT}" 2>/dev/null || true
+
   echo "Remote GPG forwarding stopped"
 
   # Delete this script itself
@@ -311,6 +254,44 @@ remote_cleanup() {
 
 # Register remote cleanup for all exit scenarios
 trap remote_cleanup EXIT INT TERM
+
+# Check for required commands with version checks
+echo "Checking remote dependencies"
+check_remote_cmd gpg gpg "\$(gpg --version 2>/dev/null | head -n 1 | awk '{print \$3}')" "2.2.0"
+check_remote_cmd socat socat
+
+# Import keys if requested
+${EXPORT_EMAIL:+# Import GPG keys
+echo "Importing GPG keys for ${EXPORT_EMAIL}"
+
+# Create temporary file for the public key
+PUBKEY_FILE=\$(mktemp)
+
+# Decode base64 pubkey
+echo "${PUBKEY_BASE64}" | base64 -d > "\$PUBKEY_FILE"
+
+# Launch keyboxd
+if command -v gpgconf &>/dev/null; then
+  # kill components as could be running in another session and lock the db
+  gpgconf --kill gpg-agent 2>/dev/null || true
+  gpgconf --kill keyboxd 2>/dev/null || true
+  gpgconf --launch keyboxd 2>/dev/null || true
+fi
+
+# Import the public key
+if ! gpg --import "\$PUBKEY_FILE"; then
+  echo "❌ ERROR: Failed to import GPG public keys on remote host"
+  exit 1
+fi
+
+# Verify key was imported
+if ! gpg --list-keys | grep -q "\$(gpg --list-packets < "\$PUBKEY_FILE" | grep -i "keyid" | head -1 | awk '{print \$NF}')"; then
+  echo "❌ ERROR: Could not verify GPG public keys were imported correctly"
+  exit 1
+fi
+
+echo "✅ GPG public keys imported on ${REMOTE_HOST} for ${EXPORT_EMAIL}"
+echo ""}
 
 # Setup directories
 mkdir -p ~/.gnupg /run/user/\$(id -u)/gnupg
@@ -348,7 +329,7 @@ for ((i=1; i<=\$MAX_TRIES; i++)); do
 done
 
 # Verify GPG agent connection
-GPG_AGENT_RESPONSE=\$(gpg-connect-agent "getinfo version" /bye)
+GPG_AGENT_RESPONSE=\$(gpg-connect-agent --no-autostart "getinfo version" /bye)
 if echo "\$GPG_AGENT_RESPONSE" | grep -q "OK"; then
   echo "✅ GPG agent forwarding to $REMOTE_HOST verified. You can use GPG with local private keys."
 else
@@ -363,17 +344,31 @@ echo "Press Ctrl+C to stop forwarding and exit"
 wait \$REMOTE_SOCAT_PID
 EOF
 
-chmod +x "$TMP_SCRIPT"
+chmod +x "$LOCAL_SCRIPT"
+
+# Print status
+echo "Connect to $REMOTE_HOST and setup remote forwarding"
+
+# Copy script to remote host with port-specific name
+if ! scp -q "$LOCAL_SCRIPT" "$REMOTE_HOST:$REMOTE_SCRIPT"; then
+  echo "❌ ERROR: Failed to transfer setup script to $REMOTE_HOST"
+  exit 1
+fi
+
+# Kill any existing socat processes for the chosen port
+pkill -f "socat.*${GPG_PORT}.*npiperelay.*gpg-agent" || true
+
+# Start socat for main GPG agent socket - forward Windows socket to TCP port
+# properly escape backslashes for socat
+echo "Start npiperelay for local named pipe -> TCP socket"
+SOCAT_ASSUAN_FILE=$(echo "$WIN_ASSUAN_FILE" | sed 's/\\/\\\\\\\\/g')
+socat -d0 TCP4-LISTEN:${GPG_PORT},bind=localhost,fork,reuseaddr \
+    EXEC:"npiperelay.exe -ei -ep -a \"${SOCAT_ASSUAN_FILE}\"" &
+LOCAL_SOCAT_PID=$!
 
 # Print status
 # GPG Agent is now available via TCP at localhost
 echo "Connect to $REMOTE_HOST and setup remote forwarding"
-
-# Copy script to remote host with port-specific name
-if ! scp -q "$TMP_SCRIPT" "$REMOTE_HOST:$REMOTE_SCRIPT"; then
-  echo "❌ ERROR: Failed to transfer setup script to $REMOTE_HOST"
-  exit 1
-fi
 
 # Use ssh remote forwarding with additional options:
 # -t: Force terminal allocation to ensure signals are properly forwarded
@@ -425,7 +420,7 @@ if [ $SSH_EXIT -eq 130 ]; then
   FINAL_EXIT=0
 elif [ $SSH_EXIT -eq 255 ]; then
   # Check if our socat process is still running
-  if kill -0 $SOCAT_PID 2>/dev/null; then
+  if kill -0 $LOCAL_SOCAT_PID 2>/dev/null; then
     # Our socat is still running, suggesting this wasn't a normal termination
     echo "❌ ERROR: SSH connection failed with code 255"
     echo "This may indicate network issues or authentication problems."
